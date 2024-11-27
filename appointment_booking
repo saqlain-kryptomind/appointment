@@ -1,0 +1,183 @@
+import json
+from bson import ObjectId
+from langchain.agents import initialize_agent, Tool, AgentType
+from langchain.chat_models import ChatOpenAI
+from langchain.memory import ConversationBufferMemory
+from pymongo import MongoClient
+from datetime import datetime
+
+# Database Functions
+def get_database():
+    client = MongoClient("mongodb://localhost:27017/")
+    db = client["doctor_scheduler"]
+    return db
+
+def insert_appointment(db, appointment):
+    appointments = db["appointments"]
+    return appointments.insert_one(appointment).inserted_id
+
+def find_appointment(db, user_id, appointment_id):
+    """Find an appointment by ObjectId and user_id."""
+    appointments = db["appointments"]
+    try:
+        return appointments.find_one({"_id": ObjectId(appointment_id), "user_id": user_id})
+    except Exception as e:
+        print(f"Error in find_appointment: {e}")
+        return None
+
+def update_appointment(db, appointment_id, updates):
+    """Update an appointment by ObjectId."""
+    appointments = db["appointments"]
+    try:
+        return appointments.update_one({"_id": ObjectId(appointment_id)}, {"$set": updates})
+    except Exception as e:
+        print(f"Error in update_appointment: {e}")
+        return None
+
+def delete_appointment(db, appointment_id):
+    """Delete an appointment by ObjectId."""
+    appointments = db["appointments"]
+    try:
+        return appointments.delete_one({"_id": ObjectId(appointment_id)})
+    except Exception as e:
+        print(f"Error in delete_appointment: {e}")
+        return None
+
+# Calendar Simulation
+calendar = {}
+
+def check_availability(doctor_name, date, time):
+    """Check if the doctor is available at the requested time."""
+    return calendar.get((doctor_name, date, time)) != "Booked"
+
+def update_calendar(doctor_name, date, time, status):
+    """Update the calendar with appointment status."""
+    calendar[(doctor_name, date, time)] = status
+
+# Functions for scheduling, editing, and canceling appointments
+def schedule_appointment(input_data):
+    try:
+        input_data = json.loads(input_data)  # Parse input
+        db = get_database()  # Get database instance
+        user_id = input_data["user_id"]
+        doctor_name = input_data["doctor_name"]
+        date = input_data["date"]
+        time = input_data["time"]
+
+        if check_availability(doctor_name, date, time):
+            appointment = {
+                "user_id": user_id,
+                "doctor_name": doctor_name,
+                "date": date,
+                "time": time,
+                "status": "Scheduled",
+            }
+            appointment_id = insert_appointment(db, appointment)
+            update_calendar(doctor_name, date, time, "Booked")
+            return f"Appointment scheduled successfully! ID: {appointment_id}"
+        else:
+            return "The selected time slot is not available."
+    except Exception as e:
+        return f"Error in scheduling appointment: {e}"
+
+def edit_appointment(input_data):
+    try:
+        input_data = json.loads(input_data)
+        db = get_database()
+        user_id = input_data["user_id"]
+        appointment_id = input_data["appointment_id"]
+        new_date = input_data["new_date"]
+        new_time = input_data["new_time"]
+
+        appointment = find_appointment(db, user_id, appointment_id)
+        if appointment is None:
+            return "Appointment not found."
+
+        doctor_name = appointment["doctor_name"]
+        if check_availability(doctor_name, new_date, new_time):
+            update_appointment(db, appointment_id, {"date": new_date, "time": new_time, "status": "Rescheduled"})
+            update_calendar(doctor_name, new_date, new_time, "Booked")
+            update_calendar(doctor_name, appointment["date"], appointment["time"], "Available")
+            return "Appointment rescheduled successfully."
+        else:
+            return "The new time slot is not available."
+    except Exception as e:
+        return f"Error in editing appointment: {e}"
+
+def cancel_appointment(input_data):
+    try:
+        input_data = json.loads(input_data)
+        db = get_database()
+        user_id = input_data["user_id"]
+        appointment_id = input_data["appointment_id"]
+
+        appointment = find_appointment(db, user_id, appointment_id)
+        if appointment is None:
+            return "Appointment not found."
+
+        delete_appointment(db, appointment_id)
+        update_calendar(appointment["doctor_name"], appointment["date"], appointment["time"], "Available")
+        return "Appointment canceled successfully."
+    except Exception as e:
+        return f"Error in canceling appointment: {e}"
+
+# Define LangChain Tools
+tools = [
+    Tool(
+        name="Schedule Appointment",
+        func=schedule_appointment,
+        description="Schedules an appointment with a doctor. Input: JSON string with user_id, doctor_name, date, time."
+    ),
+    Tool(
+        name="Edit Appointment",
+        func=edit_appointment,
+        description="Edits an existing appointment. Input: JSON string with user_id, appointment_id, new_date, new_time."
+    ),
+    Tool(
+        name="Cancel Appointment",
+        func=cancel_appointment,
+        description="Cancels an existing appointment. Input: JSON string with user_id, appointment_id."
+    ),
+]
+
+# Memory for LangChain
+memory = ConversationBufferMemory(memory_key="chat_history")
+
+# Initialize LLM
+llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0, openai_api_key="")
+
+# Initialize Agent
+agent = initialize_agent(
+    tools=tools,
+    agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+    llm=llm,
+    memory=memory,
+    verbose=True,
+)
+
+# Chatbot Function
+def chatbot():
+    print("Welcome to the Doctor Appointment Scheduler!")
+    user_id = 1  # Mock user ID for now
+    
+    while True:
+        user_input = input("You: ")
+
+        if user_input.lower() == "bye":
+            print("Bot: Goodbye!")
+            break
+
+        # Wrap user input with additional data
+        try:
+            response = agent.run(
+                json.dumps({
+                    "input": user_input,
+                    "user_id": user_id
+                })
+            )
+            print(f"Bot: {response}")
+        except Exception as e:
+            print(f"Bot: An error occurred: {e}")
+
+if __name__ == "__main__":
+    chatbot()
